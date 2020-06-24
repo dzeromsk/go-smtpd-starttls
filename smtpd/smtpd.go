@@ -13,6 +13,7 @@ package smtpd
 import (
 	"bufio"
 	"bytes"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"log"
@@ -36,6 +37,8 @@ type Server struct {
 	Hostname     string        // optional Hostname to announce; "" to use system hostname
 	ReadTimeout  time.Duration // optional read timeout
 	WriteTimeout time.Duration // optional write timeout
+
+	TLSConfig *tls.Config
 
 	PlainAuth bool // advertise plain auth (assumes you're on SSL)
 
@@ -130,7 +133,7 @@ func (srv *Server) Serve(ln net.Listener) error {
 			}
 			return e
 		}
-		sess, err := srv.newSession(rw)
+		sess, err := srv.newSession(rw, srv.TLSConfig)
 		if err != nil {
 			continue
 		}
@@ -149,14 +152,18 @@ type session struct {
 
 	helloType string
 	helloHost string
+
+	tlsConfig *tls.Config
+	tlsState  *tls.ConnectionState
 }
 
-func (srv *Server) newSession(rwc net.Conn) (s *session, err error) {
+func (srv *Server) newSession(rwc net.Conn, tlsConfig *tls.Config) (s *session, err error) {
 	s = &session{
-		srv: srv,
-		rwc: rwc,
-		br:  bufio.NewReader(rwc),
-		bw:  bufio.NewWriter(rwc),
+		srv:       srv,
+		rwc:       rwc,
+		br:        bufio.NewReader(rwc),
+		bw:        bufio.NewWriter(rwc),
+		tlsConfig: tlsConfig,
 	}
 	return
 }
@@ -226,7 +233,26 @@ func (s *session) serve() {
 			s.sendlinef("250 2.0.0 OK")
 		case "NOOP":
 			s.sendlinef("250 2.0.0 OK")
+		case "STARTTLS":
+			if s.tlsState != nil {
+				// tls state previously valid
+				s.sendlinef("454 A TLS session already agreed upon.")
+				return
+			}
+			s.sendlinef("220 2.0.0 OK")
+			s.bw.Flush()
+
+			conn := tls.Server(s.rwc, s.tlsConfig)
+			s.rwc = conn
+			s.br = bufio.NewReader(conn)
+			s.bw = bufio.NewWriter(conn)
+
+			s.tlsState = new(tls.ConnectionState)
+			*s.tlsState = conn.ConnectionState()
 		case "MAIL":
+			if s.tlsState == nil {
+				log.Printf("Warring: plain text mail connection from: %s", s.Addr())
+			}
 			arg := line.Arg() // "From:<foo@bar.com>"
 			m := mailFromRE.FindStringSubmatch(arg)
 			if m == nil {
@@ -258,6 +284,7 @@ func (s *session) handleHello(greeting, host string) {
 		"250-SIZE 10240000",
 		"250-ENHANCEDSTATUSCODES",
 		"250-8BITMIME",
+		"250-STARTTLS",
 		"250 DSN")
 	for _, ext := range extensions {
 		fmt.Fprintf(s.bw, "%s\r\n", ext)
